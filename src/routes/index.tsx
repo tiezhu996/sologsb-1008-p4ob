@@ -1,10 +1,10 @@
 import { $, component$, useSignal, useVisibleTask$, type QRL } from "@builder.io/qwik";
 import { type DocumentHead } from "@builder.io/qwik-city";
 import { createSeedProject, STATUS_LABELS, uid } from "../data";
+import { getProjectStore, PENDING_REVISION } from "../storage";
 import type { ReviewStatus, SignItem, SignProject } from "../types";
 import { analyzeSign, cloneTerms, diffText } from "../utils";
 
-const STORAGE_KEY = "sologsb-1008-project-v1";
 const WIDTHS = [320, 480, 720, 960] as const;
 
 export const head: DocumentHead = {
@@ -38,6 +38,7 @@ export default component$(() => {
   const toast = useSignal("");
   const previewId = useSignal("");
   const readOnly = useSignal(false);
+  const revision = useSignal(0);
   const active = () => project.value.signs.find((sign) => sign.id === (previewId.value || project.value.activeSignId)) ?? project.value.signs[0];
 
   const commit = $((label: string, update: (draft: SignProject) => void) => {
@@ -119,6 +120,8 @@ export default component$(() => {
         targetText: current.targetText,
         status: current.status,
         terms: cloneTerms(current.terms),
+        // 落盘时由存储引擎盖上与当前内容一致的修订号
+        revision: PENDING_REVISION,
       });
       current.versions = current.versions.slice(0, 12);
     });
@@ -185,24 +188,49 @@ export default component$(() => {
     track(() => hydrated.value);
     if (!hydrated.value) {
       try {
-        const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: SignProject };
-        if (stored.schema === 1 && stored.project?.signs?.length) project.value = stored.project;
-        const requestedPreview = new URLSearchParams(window.location.search).get("preview") ?? "";
-        previewId.value = requestedPreview;
-        readOnly.value = Boolean(requestedPreview);
+        const store = getProjectStore();
+        const outcome = store.load(createSeedProject());
+        project.value = outcome.project;
+        revision.value = outcome.revision;
+        if (outcome.migrated) {
+          toast.value = "旧数据已原位升级为分区存储，历史版本完整保留";
+        } else if (outcome.migrationDeferred) {
+          toast.value = "容量不足，旧数据暂未升级，释放空间后下次写入会自动重试";
+        }
+        if (outcome.recovered) {
+          toast.value = outcome.rolledBack
+            ? "检测到中断的写入，已回滚到上一份完整修订"
+            : "检测到中断的写入，已从待处理区恢复";
+        }
       } catch {
-        // Keep bundled sample data when storage is unavailable or malformed.
+        // 存储不可用时保留内置示例数据
       }
+      const requestedPreview = new URLSearchParams(window.location.search).get("preview") ?? "";
+      previewId.value = requestedPreview;
+      readOnly.value = Boolean(requestedPreview);
       hydrated.value = true;
     }
   });
 
   useVisibleTask$(({ track, cleanup }) => {
     track(() => hydrated.value);
-    if (!hydrated.value) return;
+    if (!hydrated.value || readOnly.value) return;
     track(() => project.value);
     const timer = window.setTimeout(() => {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ schema: 1, project: project.value }));
+      const store = getProjectStore();
+      const result = store.persist(project.value);
+      revision.value = result.revision;
+      if (result.rolledBack) {
+        const restored = store.current();
+        if (restored) project.value = restored;
+        past.value = [];
+        future.value = [];
+        toast.value = "写入失败：容量不足，已回滚到上一份完整修订";
+      } else if (!result.ok) {
+        toast.value = "本次写入未完成，重新打开时会从待处理区接着恢复";
+      } else if (result.archivedTotal > 0) {
+        toast.value = `容量不足，已按标识分批归档 ${result.archivedTotal} 条已确认快照`;
+      }
     }, 450);
     cleanup(() => window.clearTimeout(timer));
   });
@@ -210,6 +238,10 @@ export default component$(() => {
   useVisibleTask$(({ cleanup }) => {
     const updateOnline = () => { online.value = navigator.onLine; };
     updateOnline();
+    const flushPending = () => {
+      if (!hydrated.value || readOnly.value) return;
+      getProjectStore().persist(project.value);
+    };
     const keydown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
       if (target?.matches("input, textarea, select, [contenteditable='true']")) return;
@@ -238,10 +270,12 @@ export default component$(() => {
     window.addEventListener("online", updateOnline);
     window.addEventListener("offline", updateOnline);
     window.addEventListener("keydown", keydown);
+    window.addEventListener("pagehide", flushPending);
     cleanup(() => {
       window.removeEventListener("online", updateOnline);
       window.removeEventListener("offline", updateOnline);
       window.removeEventListener("keydown", keydown);
+      window.removeEventListener("pagehide", flushPending);
     });
   });
 
@@ -291,6 +325,7 @@ export default component$(() => {
           />
         </div>
         <div class="navbar-end gap-2">
+          <span class="badge badge-outline border-white/40 text-white/90" title="版本快照与当前内容共用的修订号">修订 #{revision.value}</span>
           <span class={`badge ${online.value ? "badge-success" : "badge-warning"} badge-outline`}>{online.value ? "在线" : "离线草稿"}</span>
           <button class="btn btn-ghost btn-sm" disabled={!past.value.length} onClick$={undo}>撤销</button>
           <button class="btn btn-ghost btn-sm" disabled={!future.value.length} onClick$={redo}>重做</button>
@@ -529,7 +564,11 @@ export default component$(() => {
                 {active().versions.length ? (
                   <>
                     <select class="select select-sm select-bordered mt-3 w-full" value={selectedVersionId.value || active().versions[0].id} onChange$={(_, element) => selectedVersionId.value = element.value}>
-                      {active().versions.map((version) => <option key={version.id} value={version.id}>{`${version.label} · ${new Date(version.createdAt).toLocaleTimeString()}`}</option>)}
+                      {active().versions.map((version) => (
+                        <option key={version.id} value={version.id}>
+                          {`${version.label} · 修订 #${version.revision > 0 ? version.revision : "—"}${version.archived ? " · 已归档" : ""} · ${new Date(version.createdAt).toLocaleTimeString()}`}
+                        </option>
+                      ))}
                     </select>
                     <div class="mt-3 rounded-lg bg-slate-900 p-3 text-sm leading-7 text-slate-100">
                       {comparison().map((token, index) => (
@@ -537,6 +576,9 @@ export default component$(() => {
                       ))}
                     </div>
                     <div class="mt-2 flex gap-3 text-[11px]"><span class="text-green-700">绿：新增</span><span class="text-red-700">红：删除</span></div>
+                    {active().versions.some((version) => version.archived) && (
+                      <p class="mt-2 text-[11px] text-slate-400">部分已确认快照已按标识归档以释放容量，归档版本仍可参与比较。</p>
+                    )}
                   </>
                 ) : (
                   <div class="mt-3 rounded-xl border border-dashed p-5 text-center text-xs text-slate-400">保存当前译文后会在这里生成可比较版本。</div>
