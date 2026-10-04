@@ -3,8 +3,8 @@ import { type DocumentHead } from "@builder.io/qwik-city";
 import { createSeedProject, STATUS_LABELS, uid } from "../data";
 import type { ReviewStatus, SignItem, SignProject } from "../types";
 import { analyzeSign, cloneTerms, diffText } from "../utils";
+import { loadProject, saveProject } from "../storage";
 
-const STORAGE_KEY = "sologsb-1008-project-v1";
 const WIDTHS = [320, 480, 720, 960] as const;
 
 export const head: DocumentHead = {
@@ -36,9 +36,18 @@ export default component$(() => {
   const replyDraft = useSignal("");
   const replyingTo = useSignal("");
   const toast = useSignal("");
+  const toastKind = useSignal<"success" | "warning" | "error">("success");
   const previewId = useSignal("");
   const readOnly = useSignal(false);
+  const committedProject = useSignal<SignProject>(createSeedProject());
+  const dirty = useSignal(false);
+  const persistenceBusy = useSignal(false);
   const active = () => project.value.signs.find((sign) => sign.id === (previewId.value || project.value.activeSignId)) ?? project.value.signs[0];
+
+  const notify = (message: string, kind: "success" | "warning" | "error" = "success") => {
+    toast.value = message;
+    toastKind.value = kind;
+  };
 
   const commit = $((label: string, update: (draft: SignProject) => void) => {
     past.value = [...past.value.slice(-49), structuredClone(project.value)];
@@ -47,6 +56,34 @@ export default component$(() => {
     update(draft);
     draft.updatedAt = new Date().toISOString();
     project.value = draft;
+    dirty.value = true;
+  });
+
+  const persistNow = $((silent = false): boolean => {
+    if (readOnly.value || !dirty.value || persistenceBusy.value) return true;
+    persistenceBusy.value = true;
+    try {
+      const result = saveProject(project.value);
+      project.value = result.project;
+      committedProject.value = structuredClone(result.project);
+      dirty.value = false;
+      if (!silent) {
+        notify(
+          result.compactedSignId ? "容量不足，已归档一条标识的确认快照后继续保存。" : "分区修订已保存",
+          result.compactedSignId ? "warning" : "success",
+        );
+      }
+      return true;
+    } catch (error) {
+      project.value = structuredClone(committedProject.value);
+      past.value = [];
+      future.value = [];
+      dirty.value = false;
+      if (!silent) notify(error instanceof DOMException ? "容量不足，写入已回滚到上一份完整修订。" : "写入失败，已回滚到上一份完整修订。", "error");
+      return false;
+    } finally {
+      persistenceBusy.value = false;
+    }
   });
 
   const updateActive = $((label: string, update: (sign: SignItem, draft: SignProject) => void) => {
@@ -62,7 +99,8 @@ export default component$(() => {
     future.value = [structuredClone(project.value), ...future.value].slice(0, 50);
     past.value = past.value.slice(0, -1);
     project.value = previous;
-    toast.value = "已撤销";
+    dirty.value = true;
+    notify("已撤销");
   });
 
   const redo = $(() => {
@@ -71,7 +109,8 @@ export default component$(() => {
     past.value = [...past.value.slice(-49), structuredClone(project.value)];
     future.value = future.value.slice(1);
     project.value = next;
-    toast.value = "已重做";
+    dirty.value = true;
+    notify("已重做");
   });
 
   const navigateSign = $((direction: 1 | -1) => {
@@ -104,7 +143,7 @@ export default component$(() => {
     });
   });
 
-  const saveVersion = $(() => {
+  const saveVersion = $(async () => {
     const sign = project.value.signs.find((item) => item.id === project.value.activeSignId);
     if (!sign) return;
     const versionId = uid("version");
@@ -122,8 +161,8 @@ export default component$(() => {
       });
       current.versions = current.versions.slice(0, 12);
     });
+    if (!(await persistNow(false))) return;
     selectedVersionId.value = versionId;
-    toast.value = "版本快照已保存";
   });
 
   const addTerm = $(() => {
@@ -171,7 +210,7 @@ export default component$(() => {
     if (!current) return;
     const url = `${window.location.origin}${window.location.pathname}?preview=${encodeURIComponent(current.id)}`;
     void navigator.clipboard?.writeText(url).catch(() => undefined);
-    toast.value = "只读预览链接已复制";
+    notify("只读预览链接已复制");
   });
 
   const preview = () => analyzeSign(active(), previewWidth.value, previewFont.value);
@@ -184,14 +223,26 @@ export default component$(() => {
   useVisibleTask$(({ track }) => {
     track(() => hydrated.value);
     if (!hydrated.value) {
+      const requestedPreview = new URLSearchParams(window.location.search).get("preview") ?? "";
+      previewId.value = requestedPreview;
+      readOnly.value = Boolean(requestedPreview);
       try {
-        const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: SignProject };
-        if (stored.schema === 1 && stored.project?.signs?.length) project.value = stored.project;
-        const requestedPreview = new URLSearchParams(window.location.search).get("preview") ?? "";
-        previewId.value = requestedPreview;
-        readOnly.value = Boolean(requestedPreview);
-      } catch {
-        // Keep bundled sample data when storage is unavailable or malformed.
+        const loaded = loadProject();
+        if (loaded.project) {
+          project.value = loaded.project;
+          committedProject.value = structuredClone(loaded.project);
+          dirty.value = false;
+        } else if (!requestedPreview) {
+          const saved = saveProject(project.value);
+          project.value = saved.project;
+          committedProject.value = structuredClone(saved.project);
+          dirty.value = false;
+        }
+        if (loaded.recovered) notify(loaded.recovered, "warning");
+      } catch (error) {
+        notify(error instanceof Error ? error.message : "本地项目读取失败", "error");
+        committedProject.value = structuredClone(project.value);
+        dirty.value = false;
       }
       hydrated.value = true;
     }
@@ -201,10 +252,14 @@ export default component$(() => {
     track(() => hydrated.value);
     if (!hydrated.value) return;
     track(() => project.value);
-    const timer = window.setTimeout(() => {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ schema: 1, project: project.value }));
-    }, 450);
-    cleanup(() => window.clearTimeout(timer));
+    if (!dirty.value) return;
+    const timer = window.setTimeout(() => { void persistNow(true); }, 450);
+    const flush = () => { void persistNow(true); };
+    window.addEventListener("pagehide", flush);
+    cleanup(() => {
+      window.clearTimeout(timer);
+      window.removeEventListener("pagehide", flush);
+    });
   });
 
   useVisibleTask$(({ cleanup }) => {
@@ -292,6 +347,7 @@ export default component$(() => {
         </div>
         <div class="navbar-end gap-2">
           <span class={`badge ${online.value ? "badge-success" : "badge-warning"} badge-outline`}>{online.value ? "在线" : "离线草稿"}</span>
+          <span class="badge badge-outline">{dirty.value ? "待保存" : `修订 R${project.value.revision ?? 0}`}</span>
           <button class="btn btn-ghost btn-sm" disabled={!past.value.length} onClick$={undo}>撤销</button>
           <button class="btn btn-ghost btn-sm" disabled={!future.value.length} onClick$={redo}>重做</button>
           <button class="btn btn-sm border-white/20 bg-white/10 text-white hover:bg-white/20" onClick$={sharePreview}>复制只读链接</button>
@@ -529,7 +585,11 @@ export default component$(() => {
                 {active().versions.length ? (
                   <>
                     <select class="select select-sm select-bordered mt-3 w-full" value={selectedVersionId.value || active().versions[0].id} onChange$={(_, element) => selectedVersionId.value = element.value}>
-                      {active().versions.map((version) => <option key={version.id} value={version.id}>{`${version.label} · ${new Date(version.createdAt).toLocaleTimeString()}`}</option>)}
+                      {active().versions.map((version) => (
+                        <option key={version.id} value={version.id}>
+                          {`${version.label} · R${version.revision ?? 0}${version.archived ? " · 已归档" : ""} · ${new Date(version.createdAt).toLocaleTimeString()}`}
+                        </option>
+                      ))}
                     </select>
                     <div class="mt-3 rounded-lg bg-slate-900 p-3 text-sm leading-7 text-slate-100">
                       {comparison().map((token, index) => (
@@ -552,7 +612,7 @@ export default component$(() => {
         </aside>
       </div>
 
-      {toast.value && <div class="toast toast-end z-50"><div class="alert alert-success"><span>{toast.value}</span></div></div>}
+      {toast.value && <div class="toast toast-end z-50"><div class={`alert ${toastKind.value === "error" ? "alert-error" : toastKind.value === "warning" ? "alert-warning" : "alert-success"}`}><span>{toast.value}</span></div></div>}
     </div>
   );
 });

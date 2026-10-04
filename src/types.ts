@@ -32,6 +32,8 @@ export interface VersionSnapshot {
   targetText: string;
   status: ReviewStatus;
   terms: TermBinding[];
+  revision?: number;
+  archived?: boolean;
 }
 
 export interface SignItem {
@@ -48,6 +50,7 @@ export interface SignItem {
   versions: VersionSnapshot[];
   emergencyRevision: boolean;
   updatedAt: string;
+  revision?: number;
 }
 
 export interface SignProject {
@@ -57,6 +60,7 @@ export interface SignProject {
   activeSignId: string;
   signs: SignItem[];
   updatedAt: string;
+  revision?: number;
 }
 
 export interface PersistedProject {
